@@ -11,3 +11,5 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+result
+result-*
