@@ -21,6 +21,10 @@ under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
+``settings.account_thresholds`` overrides the threshold per account (each
+account's own line gates its departure and its use as a landing); the
+``weekly-headroom`` strategy rebalances below the threshold onto whichever
+account has the most weekly quota left.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -51,12 +55,22 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_account_thresholds,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+# Triggers that leave a still-usable account, and so take the anti-flap
+# gates (landing must be healthy, cooldown, hysteresis). at-limit and
+# failover are escapes and skip them.
+_PROACTIVE_TRIGGERS = ("proactive", "consume-first", "weekly-headroom")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -557,6 +571,20 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _weekly_headroom(usage: dict | str | None) -> float | None:
+    """Remaining percentage of the 7-day window, or None if not reported.
+
+    The weekly-headroom strategy ranks on this axis alone: the 5h window
+    recycles too fast to plan around, and per-model windows already gate
+    the landing through ``account_headroom``.
+    """
+    if isinstance(usage, dict):
+        window = usage.get("seven_day")
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            return 100.0 - float(window["pct"])
+    return None
+
+
 def _binding_recovery_ts(
     usage: dict | str | None, models: Sequence[str], now: float
 ) -> float:
@@ -595,7 +623,8 @@ def _every_account_above_threshold(
     candidates: Sequence[str],
     headroom: dict[str, float | None],
     active_headroom: float | None,
-    threshold: float,
+    active_threshold: float,
+    threshold_for: Callable[[str], float],
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold — the state where "land somewhere healthy" has no answer.
@@ -606,16 +635,26 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None or (100.0 - active_headroom) < active_threshold:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [
+        (n, headroom.get(n)) for n in candidates if headroom.get(n) is not None
+    ]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all((100.0 - h) >= threshold_for(n) for n, h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
+
+
+def _poll_threshold(settings: AutoSwitchSettings) -> float:
+    """The lowest configured line, for poll-cadence planning."""
+    return min([
+        settings.threshold,
+        *(pct for _, pct in parse_account_thresholds(settings.account_thresholds)),
+    ])
 
 
 def _headroom_by_account(
@@ -656,10 +695,15 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Per-account thresholds, resolved to slot numbers each tick (aliases
+        # and slots can change under a running loop).
+        self._thresholds: dict[str, float] = {}
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
-        # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        # whatever the settings file happens to say. The lowest configured
+        # line, so escalation never starts late for an account that leaves
+        # early.
+        switcher.set_poll_policy_inputs(_poll_threshold(settings), self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -894,6 +938,7 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        self._thresholds = self._account_thresholds(settings)
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -934,14 +979,15 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        active_threshold = self._threshold_for(current)
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=active_threshold
         )
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
-                threshold=settings.threshold,
+                threshold=active_threshold,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1004,9 +1050,9 @@ class AutoSwitchEngine:
                 # resume spending it. `_at_drain_account` carries why this
                 # rule and `consume-first` cannot both be live.
                 trigger = "drain-return"
-            elif utilization >= settings.threshold:
+            elif utilization >= active_threshold:
                 trigger = "at-limit" if must_move else "proactive"
-            elif settings.strategy != "consume-first":
+            elif settings.strategy not in ("consume-first", "weekly-headroom"):
                 self._emit(
                     NoSwitchEvent(
                         reason="below-threshold",
@@ -1014,7 +1060,7 @@ class AutoSwitchEngine:
                         # display an impossible "100% < 99.9%".
                         detail=(
                             f"{pct_label(utilization)}% < "
-                            f"{pct_label(settings.threshold)}%"
+                            f"{pct_label(active_threshold)}%"
                         ),
                     )
                 )
@@ -1038,9 +1084,10 @@ class AutoSwitchEngine:
             else:
                 # consume-first: below the threshold we still proactively move
                 # to whichever account's weekly window resets soonest, to burn
-                # the most-perishable quota first. Candidate selection decides
-                # whether a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                # the most-perishable quota first. weekly-headroom: likewise,
+                # onto whichever has the most weekly quota left. Candidate
+                # selection decides whether such an account with room exists.
+                trigger = settings.strategy
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1090,7 +1137,7 @@ class AutoSwitchEngine:
             trigger = "failover"
 
         if (
-            (trigger in ("proactive", "consume-first")
+            (trigger in _PROACTIVE_TRIGGERS
              or (trigger == "drain-return" and not must_move))
             and self._in_cooldown(state)
         ):
@@ -1116,7 +1163,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger == "consume-first"
+            trigger in ("consume-first", "weekly-headroom")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1133,7 +1180,7 @@ class AutoSwitchEngine:
                     reason="below-threshold",
                     detail=(
                         f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(active_threshold)}%"
                     ),
                 )
             )
@@ -1260,10 +1307,12 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if (trigger == "consume-first" or drain_forced) and ordered:
+        if (
+            trigger in ("consume-first", "weekly-headroom") or drain_forced
+        ) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
-            # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
-            # decides below the threshold, where the collector only escalates
+            # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — both proactive
+            # strategies decide below the threshold, where the collector only escalates
             # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
             # A switch is imminent, so spend the fetches now and re-decide on
             # fresh data.
@@ -1372,10 +1421,14 @@ class AutoSwitchEngine:
                     now=decided_now,
                 )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in ("consume-first", "weekly-headroom")
+        ):
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # (unmeasurable headroom). Never for a below-threshold strategy
+            # nudge — those API-key accounts have no weekly window to rank.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1389,6 +1442,18 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "weekly-headroom":
+                # Below the threshold and healthy: staying put is correct.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="already-most-weekly",
+                        detail=(
+                            "no account with more weekly quota left by the "
+                            "hysteresis margin, or none with room"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1468,7 +1533,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first" or drain_forced:
+            if trigger in ("consume-first", "weekly-headroom") or drain_forced:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1536,6 +1601,33 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _account_thresholds(self, settings: AutoSwitchSettings) -> dict[str, float]:
+        """``autoswitch.accountThresholds`` resolved to slot numbers. An
+        identifier that does not resolve (or is ambiguous) is skipped, so
+        that account keeps the fleet-wide line."""
+        resolved: dict[str, float] = {}
+        for ident, pct in parse_account_thresholds(settings.account_thresholds):
+            try:
+                num = self.switcher._resolve_account_identifier(ident)
+            except ClaudeSwitchError:
+                num = None
+            if num is not None:
+                resolved[str(num)] = pct
+        return resolved
+
+    def _threshold_for(
+        self, num: str | None, settings: AutoSwitchSettings | None = None
+    ) -> float:
+        """The threshold that gates this account, resolved for this tick.
+
+        ``settings`` is for the helpers that take their settings as a
+        parameter (and the tests that build them without ``__init__``).
+        """
+        default = (settings or self.settings).threshold
+        if num is None:
+            return default
+        return getattr(self, "_thresholds", {}).get(str(num), default)
+
     def _resolved_drain_account(self, settings: AutoSwitchSettings) -> str | None:
         """``autoswitch.drainAccount`` as an account number, or None if not usable.
 
@@ -1581,6 +1673,8 @@ class AutoSwitchEngine:
 
         A DISABLED drain account does not win either — see
         :meth:`_drain_account_target` for why disabling outranks it.
+        ``weekly-headroom`` is held back here for the same reason as
+        consume-first: it too departs a healthy account.
         """
         num = self._resolved_drain_account(settings)
         return (
@@ -1653,7 +1747,7 @@ class AutoSwitchEngine:
             # headroom somewhere else in the codebase.
             return None
         h = headroom.get(num)
-        if h is None or (100.0 - h) >= settings.threshold:
+        if h is None or (100.0 - h) >= self._threshold_for(num):
             return None
         return num
 
@@ -1769,7 +1863,7 @@ class AutoSwitchEngine:
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
-                and left_headroom > 100.0 - settings.threshold
+                and left_headroom > 100.0 - self._threshold_for(barred, settings)
             ):
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
@@ -1945,7 +2039,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if h is not None and h > 100.0 - self._threshold_for(barred, settings):
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -2011,7 +2105,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif h > 100.0 - self._threshold_for(barred, settings):
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -2054,6 +2148,12 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # weekly-headroom ranks by remaining 7d quota; a below-threshold
+        # target must beat the active account's by the hysteresis margin.
+        # One-way on its own axis: the active burns down, the peer holds,
+        # so a reverse move needs 2x the margin of real weekly burn.
+        weekly = settings.strategy == "weekly-headroom"
+        active_weekly = _weekly_headroom(usage.get(current)) if weekly else None
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2067,7 +2167,11 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            headroom,
+            active_headroom,
+            self._threshold_for(current),
+            self._threshold_for,
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -2114,17 +2218,18 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
+            weekly_h = _weekly_headroom(usage.get(num)) if weekly else None
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
+            if trigger in _PROACTIVE_TRIGGERS:
+                # Landing must be healthy: an account at/over ITS threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (100.0 - h) >= self._threshold_for(num) and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -2183,13 +2288,20 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                elif weekly:
+                    if trigger == "weekly-headroom" and (
+                        weekly_h is None
+                        or active_weekly is None
+                        or weekly_h - active_weekly < settings.hysteresis_pct
+                    ):
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and trigger in _PROACTIVE_TRIGGERS:
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -2218,6 +2330,10 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif weekly:
+                # Most weekly quota left first (unknown sorts last), most
+                # binding headroom breaks ties, then sequence order.
+                key = (-weekly_h if weekly_h is not None else float("inf"), -h)
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -2562,7 +2678,9 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self.switcher.set_poll_policy_inputs(
+            _poll_threshold(self.settings), self._models
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

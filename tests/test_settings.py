@@ -361,3 +361,47 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestAccountThresholds:
+    """`autoswitch.accountThresholds` — per-account overrides of the line."""
+
+    def test_round_trips_and_parses(self, tmp_path: Path):
+        from claude_swap.settings import parse_account_thresholds
+
+        value = set_setting(
+            tmp_path, "autoswitch.accountThresholds", "work=95, 2=90,me@x.io=85"
+        )
+        assert load_settings(tmp_path).account_thresholds == value
+        assert parse_account_thresholds(value) == (
+            ("work", 95.0), ("2", 90.0), ("me@x.io", 85.0),
+        )
+
+    def test_set_rejects_malformed_or_out_of_range(self, tmp_path: Path):
+        for bad in ("work", "work=", "=95", "work=200", "work=95,2=abc"):
+            with pytest.raises(ConfigError, match="accountThresholds"):
+                set_setting(tmp_path, "autoswitch.accountThresholds", bad)
+        assert not settings_path(tmp_path).exists()
+
+    def test_lenient_parse_drops_bad_entries(self):
+        from claude_swap.settings import parse_account_thresholds
+
+        assert parse_account_thresholds("work=95,bogus,2=200,,3=60") == (
+            ("work", 95.0), ("3", 60.0),
+        )
+        assert parse_account_thresholds(None) == ()
+        assert parse_account_thresholds("") == ()
+
+    def test_cli_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(account_thresholds="work=95"),
+            _args(account_threshold="2=90"),
+        )
+        assert merged.account_thresholds == "2=90"
+
+    def test_weekly_headroom_is_a_valid_strategy(self, tmp_path: Path):
+        assert (
+            set_setting(tmp_path, "autoswitch.strategy", "weekly-headroom")
+            == "weekly-headroom"
+        )
+        assert load_settings(tmp_path).strategy == "weekly-headroom"

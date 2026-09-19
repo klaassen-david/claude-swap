@@ -7646,3 +7646,189 @@ class TestDrainReturnOutranksTheOverflowAccountsState:
         assert h.active_number() == 3
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "failover"
+
+
+class TestWeeklyHeadroom:
+    """`strategy: weekly-headroom` — proactively sit on the account with the
+    most weekly quota left, so a pool of accounts is spent evenly."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        kw.setdefault("threshold", 90.0)
+        h = EngineHarness(temp_home, strategy="weekly-headroom", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _switch(self, h: EngineHarness) -> SwitchEvent:
+        return next(e for e in h.events if isinstance(e, SwitchEvent))
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_below_threshold_moves_to_the_most_weekly_quota_left(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 60),
+            "2": _usage7(20, 30),
+            "3": _usage7(20, 10),   # most weekly quota left
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert self._switch(h).trigger == "weekly-headroom"
+
+    def test_stays_when_no_peer_clears_the_hysteresis_margin(self, temp_home):
+        h = self._harness(temp_home, hysteresis_pct=10.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 30),
+            "2": _usage7(20, 25),   # 5 points better — under the margin
+            "3": _usage7(20, 40),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["already-most-weekly"]
+
+    def test_never_lands_on_an_account_over_its_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 40),
+            "2": _usage7(95, 0),    # most weekly left, but its 5h is spent
+            "3": _usage7(20, 50),   # less weekly left than the active
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_threshold_departure_ranks_by_weekly_not_binding_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 40),
+            "2": _usage7(60, 10),   # binding headroom 40, weekly 90
+            "3": _usage7(10, 50),   # binding headroom 50, weekly 50
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, "best would pick 3; weekly-headroom picks 2"
+        assert self._switch(h).trigger == "proactive"
+
+    def test_a_spent_session_window_still_leaves_for_a_worse_weekly_peer(self, temp_home):
+        """The weekly rule never strands a session: at the threshold on the 5h
+        window, the only healthy peer is taken even with less weekly left."""
+        h = self._harness(temp_home, threshold=98.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(98, 10),   # session window spent, weekly nearly full
+            "2": _usage7(20, 70),   # far less weekly left — still the target
+            "3": _usage7(99, 0),    # spent too
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert self._switch(h).trigger == "proactive"
+
+    def test_holds_on_a_healthy_drain_account(self, temp_home):
+        h = self._harness(temp_home, drain_account="1")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 60),
+            "2": _usage7(20, 0),
+            "3": _usage7(20, 0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["drain-preferred"]
+
+    def test_never_chooses_a_disabled_account(self, temp_home):
+        h = self._harness(temp_home)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 60),
+            "2": _usage7(20, 30),
+            "3": _usage7(20, 0),    # best weekly, but held out of rotation
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_reverse_move_needs_real_weekly_burn(self, temp_home):
+        h = self._harness(temp_home, hysteresis_pct=10.0)
+        assert h.tick_with_usage({
+            "1": _usage7(20, 60), "2": _usage7(20, 30), "3": _usage7(20, 80),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(400)
+        h.events.clear()
+        # Account 2 burned to 65: one point worse than 1, under the margin.
+        assert h.tick_with_usage({
+            "1": _usage7(20, 60), "2": _usage7(20, 65), "3": _usage7(20, 80),
+        }) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        h.events.clear()
+        # Burned past the margin: now 1 is the account with the most left.
+        assert h.tick_with_usage({
+            "1": _usage7(20, 60), "2": _usage7(20, 75), "3": _usage7(20, 80),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+
+class TestPerAccountThresholds:
+    """`autoswitch.accountThresholds` — each account's own line gates its
+    departure, its use as a landing, and a drain return to it."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=98.0, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_active_leaves_at_its_own_line(self, temp_home):
+        h = self._harness(temp_home, account_thresholds="1=95")
+        outcome = h.tick_with_usage({
+            "1": _usage(96), "2": _usage(10), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.threshold == 95.0
+
+    def test_unnamed_accounts_keep_the_fleet_line(self, temp_home):
+        h = self._harness(temp_home, account_thresholds="1=95")
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        outcome = h.tick_with_usage({
+            "1": _usage(10), "2": _usage(96), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.threshold == 98.0
+
+    def test_resolves_by_email(self, temp_home):
+        h = self._harness(temp_home, account_thresholds="a@example.com=95")
+        assert h.tick_with_usage({
+            "1": _usage(96), "2": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+
+    def test_landing_is_judged_by_the_candidates_own_line(self, temp_home):
+        h = self._harness(temp_home, account_thresholds="2=75")
+        outcome = h.tick_with_usage({
+            "1": _usage(99),
+            "2": _usage(80),    # under 98, but over ITS line
+            "3": _usage(80),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_drain_return_waits_for_the_drain_accounts_own_line(self, temp_home):
+        h = self._harness(temp_home, drain_account="1", account_thresholds="1=95")
+        assert h.tick_with_usage({
+            "1": _usage(96), "2": _usage(10), "3": _usage(10),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(400)
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _usage(96), "2": _usage(20), "3": _usage(20),
+        }) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage({
+            "1": _usage(94), "2": _usage(20), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1

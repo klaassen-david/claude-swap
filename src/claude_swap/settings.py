@@ -47,7 +47,9 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset), or
+    # "weekly-headroom" (most weekly quota left, rebalanced proactively).
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -66,6 +68,11 @@ class AutoSwitchSettings:
     # different anchor -- see ``AutoSwitchEngine._at_drain_account``, which
     # owns that rule. None = no drain account (default).
     drain_account: str | None = None
+    # Per-account overrides of ``threshold``: ``IDENT=PCT[,IDENT=PCT...]``
+    # where IDENT is an alias, slot number, or email. An account not named
+    # here keeps ``threshold``. Lets one account leave earlier (or later)
+    # than the rest without moving the fleet-wide line. None = no overrides.
+    account_thresholds: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,7 +136,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "weekly-headroom"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -147,6 +154,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "drainAccount", "drain_account", "string",
             help="Spend this account first; others are overflow while it is at its limit",
+        ),
+        SettingSpec(
+            "autoswitch", "accountThresholds", "account_thresholds", "string",
+            help="Per-account threshold overrides, e.g. work=95 or 2=90,me@x.io=85",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -178,6 +189,48 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_account_thresholds(
+    value: str | None, *, strict: bool = False
+) -> tuple[tuple[str, float], ...]:
+    """Split ``IDENT=PCT[,IDENT=PCT...]`` into ``((ident, pct), ...)``.
+
+    Identifiers are kept verbatim (the engine resolves alias/slot/email);
+    a later duplicate of the same spelling wins. Lenient by default — a
+    malformed or out-of-range entry is dropped, so a hand-edited
+    settings.json degrades to the fleet-wide threshold for that account
+    rather than breaking the loop. ``strict`` (``cswap config set``) raises
+    ConfigError instead, naming the bad entry.
+    """
+    if not value:
+        return ()
+    spec = SETTING_SPECS["autoswitch.threshold"]
+    parsed: dict[str, float] = {}
+    for part in value.split(","):
+        entry = part.strip()
+        if not entry:
+            continue
+        ident, sep, pct_text = entry.rpartition("=")
+        ident = ident.strip()
+        try:
+            pct = float(pct_text.strip())
+        except ValueError:
+            pct = float("nan")
+        if not sep or not ident or not (spec.lo <= pct <= spec.hi):
+            if strict:
+                raise ConfigError(
+                    f"autoswitch.accountThresholds: '{entry}' is not "
+                    f"IDENT=PCT with PCT between {format_setting_value(spec.lo)} "
+                    f"and {format_setting_value(spec.hi)}"
+                )
+            _logger.warning(
+                "settings.json: ignoring autoswitch.accountThresholds entry %r",
+                entry,
+            )
+            continue
+        parsed[ident] = pct
+    return tuple(parsed.items())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -321,6 +374,11 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.dotted == "autoswitch.accountThresholds":
+            if not parse_account_thresholds(value, strict=True):
+                raise ConfigError(
+                    f"{spec.dotted} expects IDENT=PCT[,IDENT=PCT...], got '{value}'"
+                )
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
@@ -445,6 +503,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("model", "model"),
         ("strategy", "strategy"),
         ("drain_account", "drain_account"),
+        ("account_threshold", "account_thresholds"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

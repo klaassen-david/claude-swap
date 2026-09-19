@@ -654,6 +654,14 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--account-threshold",
+        metavar="IDENT=PCT[,...]",
+        help=(
+            "Per-account threshold overrides (alias, slot number, or email); "
+            "accounts not named keep --threshold"
+        ),
+    )
+    parser.add_argument(
         "--drain-account",
         metavar="ACCOUNT",
         help=(
@@ -674,12 +682,13 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "weekly-headroom"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'weekly-headroom' (proactively use the "
+            "account with the most weekly quota left)"
         ),
     )
     parser.add_argument(
