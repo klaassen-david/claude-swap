@@ -1937,12 +1937,13 @@ class AutoSwitchEngine:
         its own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
-        not null), so it gets three legs, checked in this order, each with
-        the margin its axis already uses. Burn cannot manufacture any of
-        them: headroom rises only when a window rolls over, the ratio needs
-        the active to lose more than half its remaining headroom AND clear
-        an extra `SPENT_HEADROOM_PCT` on top, and the binding reset moves
-        nearer only when a nearer window starts binding.
+        not null), so it gets four legs, checked in this order, each with the
+        margin its axis already uses -- where its axis has one. Burn cannot
+        manufacture any of them: headroom rises only when a window rolls
+        over, the ratio needs the active to lose more than half its remaining
+        headroom AND clear an extra `SPENT_HEADROOM_PCT` on top, and neither
+        a binding reset nor a weekly one moves nearer except when a nearer
+        window starts binding.
 
           dominance   `> active x HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT`
                       against the ACTIVE. A peer moved AWAY from for a reason
@@ -1968,6 +1969,11 @@ class AutoSwitchEngine:
           recovery    `-RECOVERY_HYSTERESIS_S` against the DEPARTURE
                       baseline — the same margin the recovery axis ranks by
                       one gate later.
+          weekly      the peer's 7d reset is sooner than the ACTIVE's, under
+                      `consume-first` only. The one leg on the axis that
+                      strategy ranks by, and the only one with no margin —
+                      a `resets_at` cannot drift the way headroom does. See
+                      the leg itself.
 
         NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
         by a switch that never recorded one, carries no evidence either way —
@@ -2113,6 +2119,43 @@ class AutoSwitchEngine:
             and h >= min(left_headroom + SPENT_HEADROOM_PCT, 100.0)
         ):
             return True
+        # consume-first ranks on weekly-reset ORDERING, and not one leg above
+        # is on that axis -- both headroom legs ask about quota and the one
+        # below about a BINDING window, which for a peer days from its weekly
+        # reset is its 5h one. So an account left for reset ordering releases
+        # only by accident. The clamp above covers the peer that has not moved
+        # since (`h` back at the 100.0 cap); it cannot cover one that BURNED
+        # after we left it, which is the same departure a day later. Measured
+        # live: a drain-return departure recorded at `leftHeadroom: 100.0`,
+        # the peer since down to 23 points, holding the engine on the account
+        # resetting FOUR DAYS LATER while the peer's perishable week ran out --
+        # reported as `already-consuming-soonest`, which is what an empty
+        # ranking looks like from outside.
+        #
+        # Released when the peer's weekly window resets sooner than the
+        # ACTIVE's: the ranking's own filter, so the bar stops refusing a move
+        # the ranking would make on its own merits -- the same thing the
+        # dominance leg does on the headroom axis, and for the same departures
+        # it was written for ("moved AWAY from for a reason other than
+        # headroom", above).
+        #
+        # NO MARGIN OF ITS OWN, unlike every sibling gate, because this axis
+        # cannot drift: the ordering flips only when a weekly window ROLLS
+        # OVER, and the account we take is then the later one, so the filter
+        # itself refuses the return. The percentage-point and seconds margins
+        # elsewhere absorb burn, which moves headroom continuously; nothing
+        # moves a `resets_at` continuously. A margin here would only open a
+        # band where the bar holds while the ranking wants the move -- the
+        # stall this leg exists to end.
+        if settings.strategy == "consume-first":
+            peer_week = _seven_day_reset_ts(usage.get(barred), now)
+            active_week = _seven_day_reset_ts(usage.get(current), now)
+            if (
+                peer_week is not None
+                and active_week is not None
+                and peer_week < active_week
+            ):
+                return True
         # `None` is the JSON-safe spelling of "unknown or already past", which
         # `_binding_recovery_ts` returns as `inf`: an account nobody can
         # schedule around. Moving off it onto a real reset IS the improvement.

@@ -4293,68 +4293,67 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_an_ordinary_departure_does_not_stall_on_a_weekly_bound_peer(
-        self, temp_home
+        self, harness
     ):
-        """The anti-flap snapshot stalls ORDINARY departures too, not
-        just failover, whenever the barred peer is weekly-bound.
+        """The anti-flap snapshot stalls ORDINARY departures too, not just
+        failover, whenever the barred peer is weekly-bound.
 
         Same root as the failover recovery leg (a release keyed away from
         the ACTIVE), reached without any failover: an ordinary consume-first
-        departure records
-        `leftHeadroom`/`leftRecoveryAt`, and `_left_account_recovered`'s
-        headroom leg (`h >= left_headroom + SPENT_HEADROOM_PCT`) can only
-        rise when the barred peer's OWN headroom improves. A peer whose
-        headroom is pinned by 7-day utilization (5-hour rollovers do not
-        raise it) never improves, and its `resets_at` is a fixed absolute
-        that never creeps nearer, so the recovery leg cannot fire either —
-        both legs are permanently unsatisfiable even though the peer is
-        already 35x better than the active.
+        departure records `leftHeadroom`/`leftRecoveryAt`, and the headroom
+        leg (`h >= left_headroom + SPENT_HEADROOM_PCT`) can only rise when
+        the barred peer's OWN headroom improves. A peer whose headroom is
+        pinned by 7-day utilization (5-hour rollovers do not raise it) never
+        improves, and its `resets_at` is a fixed absolute that never creeps
+        nearer, so the recovery leg cannot fire either — both permanently
+        unsatisfiable even though the peer is already 7x better than the
+        active.
 
-        Peer 1's reset (20 days out) stays sooner than active account 2's
-        (400 days out) throughout, so the ordinary consume-first
-        reset-ordering gate does not exclude it either; only the anti-flap
-        snapshot does.
+        DISCRIMINATES RELATIONAL FROM ABSOLUTE: peer 70 against active 50 is
+        chosen so that ANY absolute floor at or below 70 — the defect class
+        an earlier cut shipped — releases the peer outright, while the
+        relational fix needs `70 > 50 x 2 + 3 = 103`, which is false. Only
+        once the active has burned enough for the RATIO against it (not the
+        peer's own absolute value) to clear does the release fire.
 
-        DISCRIMINATES RELATIONAL FROM ABSOLUTE: the first tick below
-        (active_pct=50, active_headroom=50.0) is chosen so that ANY absolute
-        floor at or below 70 — the defect class an earlier cut shipped,
-        which this test could not tell apart from a relational fix — would
-        release the peer immediately (70 clears a `>= floor<=70` bar
-        outright), while the relational fix
-        needs `70 > 50 x 2 + 3 = 103`, which is false, so it must still hold
-        at that first tick. Only once the active has burned enough for the
-        RATIO against it (not the peer's own absolute value) to clear does
-        the release fire.
+        PINNED ON THE LEG rather than driven end-to-end, because the fleet
+        that carried it is no longer reachable under consume-first: below the
+        threshold the ranking admits a peer only when its weekly window
+        resets SOONER than the active's, and the weekly leg now releases the
+        bar on exactly that condition — so a peer held by the bar while the
+        ranking wants it cannot be staged any more (see
+        `test_a_sooner_weekly_reset_releases_a_bar_from_a_full_quota_departure`).
+        The peer's weekly reset is held LATER here to keep the axis under
+        test the headroom one.
         """
-        h = EngineHarness(temp_home, strategy="consume-first")
-        h.seed(1, "a@example.com")
-        h.seed(2, "b@example.com")
-        h.make_live("a@example.com", 1)
+        from claude_swap.settings import AutoSwitchSettings
 
-        assert h.tick_with_usage({
-            "1": _usage7(30, 30, self._days_out(h, 20)),   # 70 pts, resets in 20d
-            "2": _usage7(50, 50, self._days_out(h, 10)),   # 50 pts, resets SOONER
-        }) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-        h.clock.advance(301.0)
+        settings = AutoSwitchSettings(strategy="consume-first")
+        state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": 70.0,
+            # A float epoch, as `_perform` writes it — `_at` renders the ISO
+            # string a `resets_at` carries, and a string here reads as
+            # "unmeasured" and releases on the recovery leg.
+            "leftRecoveryAt": harness.clock() + 20 * 24 * 3600,
+            "leftTrigger": "consume-first",
+        }
+        # Peer 1 pinned by its 7d window — 5h rollovers cannot raise 70
+        # points — and resetting LATER than the active. Frozen on both axes.
+        usage = {
+            "1": _usage7(0.0, 30.0, self._days_out(harness, 20 * 24)),
+            "2": _usage7(50.0, 50.0, self._days_out(harness, 2 * 24)),
+        }
+        args = (state, usage, {"1": 70.0})
+        tail = (settings, harness.clock(), "2")
 
-        outcomes = []
-        for active_pct in (50, 80, 90, 95, 98, 99.5, 100):
-            outcomes.append(h.tick_with_usage({
-                "1": _usage7(30, 30, self._days_out(h, 20)),   # frozen, 70 pts
-                "2": _usage7(active_pct, active_pct, self._days_out(h, 400)),
-            }))
-            h.clock.advance(301.0)
-
-        assert outcomes[0] is not TickOutcome.SWITCHED, (
-            f"{[o.name for o in outcomes]} — the very first tick (active at "
-            "50%, ratio only 1.4x) already switched. An absolute floor <= 70 "
-            "would fire here immediately; the relational fix must not."
+        assert harness.engine._left_account_recovered(*args, 50.0, *tail) is False, (
+            "active on 50 points, a ratio of only 1.4x: an absolute floor "
+            "<= 70 would fire here immediately; the relational fix must not"
         )
-        assert TickOutcome.SWITCHED in outcomes[:-1], (
-            f"{[o.name for o in outcomes]} — peer 1 held 70 points the whole "
-            "time, far ahead of the active, and the engine only returned "
-            "once the active hit a hard 100%"
+        assert harness.engine._left_account_recovered(*args, 10.0, *tail) is True, (
+            "peer 1 holds 70 points against an active on 10 — 70 > 10*2+3 — "
+            "and must not have to wait for the active to hit a hard 100%"
         )
 
     def test_a_filtered_candidate_does_not_forge_an_all_exhausted_claim(
@@ -5126,6 +5125,84 @@ class TestHorizonAxisDoesNotFlap:
         # confirms the clamp, not some other leg, is what makes it True.
         assert not (100.0 >= 98.0 + SPENT_HEADROOM_PCT), (
             "premise: the unclamped threshold is unsatisfiable at h=100.0"
+        )
+
+    def test_a_sooner_weekly_reset_releases_a_bar_from_a_full_quota_departure(
+        self, temp_home
+    ):
+        """The peer BURNED after being left at the 100.0 cap, so the clamp
+        cannot fire — and under consume-first nothing else could either.
+
+        The sibling above covers the peer that has NOT moved since departure
+        (`h` still 100.0, which the clamp releases). A day of use later the
+        same record is unreleasable: `h` has fallen, so both headroom legs
+        fail, and a peer days from its weekly reset is bound by a 5h window
+        whose reset is LATER than the elapsed one recorded at departure, so
+        the recovery leg fails too. Nothing left is on the axis consume-first
+        actually ranks by.
+
+        Measured live 2026-09-21 — a `drain-return` departure recorded
+        2026-09-19 at `leftHeadroom: 100.0`, the peer since down to 23 points
+        and resetting FOUR DAYS BEFORE the active account. The engine sat on
+        the account resetting last and reported `already-consuming-soonest`,
+        which is what an empty ranking looks like from outside, while the
+        peer's perishable week ran out.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=98.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        # The engine's own last move, 2 -> 1, recorded while 2 was untouched;
+        # its binding window then was a 5h one that has since elapsed.
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "lastSwitchAt": h.clock() - 10_000.0,
+                "lastSwitchTo": "1",
+                "lastSwitchFrom": 2,
+                "leftHeadroom": 100.0,
+                "leftRecoveryAt": h.clock() - 5_000.0,
+                "leftTrigger": "drain-return",
+            })
+        )
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(2.0, 64.0, self._days_out(h, 24 * 6)),  # resets LAST
+            "2": _usage7(0.0, 77.0, self._days_out(h, 24 * 2)),  # resets FIRST
+        })
+
+        assert (outcome, h.active_number()) == (TickOutcome.SWITCHED, 2), (
+            f"{outcome.name} on account {h.active_number()}: the barred peer "
+            "resets four days sooner and has 23 points to spend before it "
+            "does, which is the whole of what consume-first ranks by. "
+            "Dominance (23 > 36*2+3) and the clamp (23 >= 100) both fail by "
+            "construction here, so without a leg on the weekly axis the bar "
+            "holds until the ACTIVE account burns down"
+        )
+
+    def test_the_weekly_leg_is_scoped_to_consume_first(self, harness):
+        """Same record, same fleet, `strategy: best` — no release.
+
+        The other strategies do not rank on reset ordering, so a sooner
+        weekly reset is not evidence of anything to them, and a leg that
+        leaked would disarm the bar for a fleet that never asked for it.
+        """
+        state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": 100.0,
+            "leftRecoveryAt": harness.clock() - 5_000.0,
+            "leftTrigger": "drain-return",
+        }
+        usage = {
+            "1": _usage7(0.0, 77.0, self._days_out(harness, 24 * 2)),
+            "2": _usage7(2.0, 64.0, self._days_out(harness, 24 * 6)),
+        }
+        recovered = harness.engine._left_account_recovered(
+            state, usage, {"1": 23.0}, 36.0, harness.settings, harness.clock(), "2"
+        )
+        assert recovered is False, (
+            "`best` ranks by headroom; the peer's sooner weekly reset must "
+            "not release its bar"
         )
 
     def test_the_dominance_leg_does_not_silently_read_an_unreadable_active_as_no_dominance(
